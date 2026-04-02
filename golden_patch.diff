@@ -1,0 +1,353 @@
+diff --git a/src/core/pipeline.ts b/src/core/pipeline.ts
+index 829c1ee..eb2bb5b 100644
+--- a/src/core/pipeline.ts
++++ b/src/core/pipeline.ts
+@@ -3,9 +3,12 @@ import { MetricsCollector } from '../metrics/metrics';
+ import { StructuredLogger } from '../metrics/logger';
+ import { LruCache } from '../storage/cache';
+ import { PipelineExecutionResult, ProcessNoteRequest, ProcessingContext, ProcessingResult } from '../types';
+-import { ProcessorRegistry } from './registry';
++import { ProcessorRegistry, ResolvedProcessor, resolveProcessorGraph } from './registry';
+ 
+ function clone<T>(value: T): T {
++  if (value === undefined) {
++    return value;
++  }
+   return JSON.parse(JSON.stringify(value)) as T;
+ }
+ 
+@@ -38,6 +41,9 @@ export class Pipeline {
+         id: entry.config.id,
+         enabled: entry.config.enabled,
+         order: entry.config.order,
++        dependencyIds: entry.config.dependencyIds,
++        hasCondition: entry.config.condition !== undefined,
++        hasOutputTransform: entry.config.outputTransform !== undefined,
+         options: entry.config.options,
+       })),
+     }));
+@@ -61,14 +67,70 @@ export class Pipeline {
+       originalContent: request.content,
+       workingContent: request.content,
+       result,
++      outputs: {},
+       startedAt,
+     };
+ 
+     const errors: string[] = [];
+     const warnings: string[] = [];
+     const processorsRun: string[] = [];
++    const skippedProcessors: string[] = [];
++    const dynamicProcessors: string[] = [];
++    const skippedSet = new Set<string>();
++    const allProcessors = new Map<string, ResolvedProcessor>(
++      resolvedProcessors.map((entry) => [entry.config.id, entry]),
++    );
++    const pending = new Map<string, ResolvedProcessor>(
++      resolvedProcessors.map((entry) => [entry.config.id, entry]),
++    );
++
++    context.registerProcessor = (processor, config) => {
++      if (allProcessors.has(config.id) || pending.has(config.id) || skippedSet.has(config.id)) {
++        throw new Error(`Processor ${config.id} is already registered.`);
++      }
++
++      allProcessors.set(config.id, { processor, config });
++      dynamicProcessors.push(config.id);
++      if (config.enabled) {
++        pending.set(config.id, { processor, config });
++      }
++    };
++
++    while (pending.size > 0) {
++      const orderedEntries = resolveProcessorGraph(
++        new Map(Array.from(allProcessors.values()).map((entry) => [entry.config.id, entry.processor])),
++        Array.from(allProcessors.values()).map((entry) => entry.config),
++      );
++      const nextEntry = orderedEntries.find((entry) => pending.has(entry.config.id));
++      if (!nextEntry) {
++        break;
++      }
++
++      pending.delete(nextEntry.config.id);
++      const { processor, config } = nextEntry;
++      const skippedDependencies = config.dependencyIds.filter((dependencyId) => skippedSet.has(dependencyId));
++
++      if (skippedDependencies.length > 0) {
++        if (config.condition) {
++          skippedProcessors.push(config.id);
++          skippedSet.add(config.id);
++          continue;
++        }
++
++        throw new Error(
++          `Processor ${config.id} depends on skipped processor(s): ${skippedDependencies.join(', ')}`,
++        );
++      }
++
++      if (config.condition) {
++        const shouldRun = await config.condition(context);
++        if (!shouldRun) {
++          skippedProcessors.push(config.id);
++          skippedSet.add(config.id);
++          continue;
++        }
++      }
+ 
+-    for (const { processor, config } of resolvedProcessors) {
+       const validation = processor.validate(config);
+       if (!validation.valid) {
+         errors.push(...validation.errors.map((entry) => `${config.id}: ${entry.message}`));
+@@ -81,8 +143,15 @@ export class Pipeline {
+       try {
+         const run = await processor.process(context, config);
+         processorsRun.push(processor.definition.id);
+-        if (run.output) {
+-          Object.assign(context.result, run.output);
++        let visibleOutput = run.output;
++        if (visibleOutput !== undefined && config.outputTransform) {
++          visibleOutput = await config.outputTransform(visibleOutput, context) as typeof run.output;
++        }
++        if (visibleOutput !== undefined) {
++          context.outputs[config.id] = clone(visibleOutput);
++          if (typeof visibleOutput === 'object' && visibleOutput !== null) {
++            Object.assign(context.result, visibleOutput);
++          }
+         }
+         if (run.nextContent !== undefined) {
+           context.workingContent = run.nextContent;
+@@ -94,10 +163,13 @@ export class Pipeline {
+         if (run.warnings) {
+           warnings.push(...run.warnings.map((message) => `${config.id}: ${message}`));
+         }
++        context.lastError = undefined;
+         this.metrics.recordProcessorRun(processor.definition.id, performance.now() - runStarted, true);
+       } catch (error) {
+         this.metrics.recordProcessorRun(processor.definition.id, performance.now() - runStarted, false);
+-        const message = error instanceof Error ? error.message : String(error);
++        const resolvedError = error instanceof Error ? error : new Error(String(error));
++        const message = resolvedError.message;
++        context.lastError = resolvedError;
+         errors.push(`${config.id}: ${message}`);
+         this.logger.error('processor-failed', {
+           processorId: processor.definition.id,
+@@ -115,6 +187,8 @@ export class Pipeline {
+       warnings,
+       startedAt,
+       finishedAt,
++      skippedProcessors,
++      dynamicProcessors,
+     };
+ 
+     this.cache.set(cacheKey, clone(execution));
+diff --git a/src/core/registry.ts b/src/core/registry.ts
+index 85a65a9..1b53e74 100644
+--- a/src/core/registry.ts
++++ b/src/core/registry.ts
+@@ -6,6 +6,121 @@ export interface ResolvedProcessor {
+   config: ProcessorRuntimeConfig;
+ }
+ 
++function compareConfigs(left: ProcessorRuntimeConfig, right: ProcessorRuntimeConfig) {
++  if (left.order !== right.order) {
++    return left.order - right.order;
++  }
++
++  return left.id.localeCompare(right.id);
++}
++
++function mergeConfig(config: ProcessorRuntimeConfig, override?: ProcessorOverride): ProcessorRuntimeConfig {
++  return {
++    ...config,
++    enabled: override?.enabled ?? config.enabled,
++    options: {
++      ...config.options,
++      ...(override?.options ?? {}),
++    },
++  };
++}
++
++export function resolveProcessorGraph(
++  processors: ReadonlyMap<string, Processor>,
++  configs: Iterable<ProcessorRuntimeConfig>,
++  overrides: Record<string, ProcessorOverride> = {},
++): ResolvedProcessor[] {
++  const resolvedConfigs = new Map<string, ProcessorRuntimeConfig>();
++
++  for (const config of configs) {
++    resolvedConfigs.set(config.id, mergeConfig(config, overrides[config.id]));
++  }
++
++  const activeConfigs = Array.from(resolvedConfigs.values())
++    .filter((config) => config.enabled)
++    .sort(compareConfigs);
++  const activeIds = new Set(activeConfigs.map((config) => config.id));
++  const dependents = new Map<string, string[]>();
++  const inDegree = new Map<string, number>();
++
++  for (const config of activeConfigs) {
++    const processor = processors.get(config.id);
++    if (!processor) {
++      throw new Error(`Processor ${config.id} is not available.`);
++    }
++
++    inDegree.set(config.id, 0);
++    dependents.set(config.id, []);
++  }
++
++  for (const config of activeConfigs) {
++    for (const dependencyId of config.dependencyIds) {
++      if (dependencyId === config.id) {
++        throw new Error(`Circular dependency detected for processor ${config.id}.`);
++      }
++
++      const dependencyConfig = resolvedConfigs.get(dependencyId);
++      if (!dependencyConfig) {
++        throw new Error(`Processor ${config.id} dependency ${dependencyId} is missing.`);
++      }
++
++      if (!dependencyConfig.enabled || !activeIds.has(dependencyId)) {
++        throw new Error(`Processor ${config.id} dependency ${dependencyId} is disabled or not available.`);
++      }
++
++      if (!processors.has(dependencyId)) {
++        throw new Error(`Processor ${config.id} dependency ${dependencyId} is not available.`);
++      }
++
++      dependents.get(dependencyId)?.push(config.id);
++      inDegree.set(config.id, (inDegree.get(config.id) ?? 0) + 1);
++    }
++  }
++
++  const queue = activeConfigs
++    .filter((config) => (inDegree.get(config.id) ?? 0) === 0)
++    .sort(compareConfigs);
++  const resolved: ResolvedProcessor[] = [];
++
++  while (queue.length > 0) {
++    const currentConfig = queue.shift();
++    if (!currentConfig) {
++      break;
++    }
++
++    const processor = processors.get(currentConfig.id);
++    if (!processor) {
++      throw new Error(`Processor ${currentConfig.id} is not available.`);
++    }
++
++    resolved.push({
++      processor,
++      config: currentConfig,
++    });
++
++    for (const dependentId of dependents.get(currentConfig.id) ?? []) {
++      const nextDegree = (inDegree.get(dependentId) ?? 0) - 1;
++      inDegree.set(dependentId, nextDegree);
++      if (nextDegree === 0) {
++        const dependentConfig = resolvedConfigs.get(dependentId);
++        if (dependentConfig?.enabled) {
++          queue.push(dependentConfig);
++          queue.sort(compareConfigs);
++        }
++      }
++    }
++  }
++
++  if (resolved.length !== activeConfigs.length) {
++    const unresolvedIds = activeConfigs
++      .map((config) => config.id)
++      .filter((id) => !resolved.some((entry) => entry.config.id === id));
++    throw new Error(`Circular dependency detected: ${unresolvedIds.join(', ')}`);
++  }
++
++  return resolved;
++}
++
+ export class ProcessorRegistry {
+   private readonly processors = new Map<string, Processor>();
+   private readonly runtimeConfigs = new Map<string, ProcessorRuntimeConfig>();
+@@ -57,28 +172,6 @@ export class ProcessorRegistry {
+   }
+ 
+   resolve(overrides: Record<string, ProcessorOverride> = {}): ResolvedProcessor[] {
+-    return this.getRuntimeConfigs()
+-      .map((config) => {
+-        const processor = this.processors.get(config.id);
+-        if (!processor) {
+-          return null;
+-        }
+-
+-        const override = overrides[config.id];
+-        const resolved: ProcessorRuntimeConfig = {
+-          ...config,
+-          enabled: override?.enabled ?? config.enabled,
+-          options: {
+-            ...config.options,
+-            ...(override?.options ?? {}),
+-          },
+-        };
+-
+-        return {
+-          processor,
+-          config: resolved,
+-        };
+-      })
+-      .filter((value): value is ResolvedProcessor => value !== null && value.config.enabled);
++    return resolveProcessorGraph(this.processors, this.runtimeConfigs.values(), overrides);
+   }
+ }
+diff --git a/src/services/noteProcessingService.ts b/src/services/noteProcessingService.ts
+index 292d92f..2fb760b 100644
+--- a/src/services/noteProcessingService.ts
++++ b/src/services/noteProcessingService.ts
+@@ -23,6 +23,8 @@ export class NoteProcessingService {
+       warnings: execution.warnings,
+       startedAt: execution.startedAt,
+       finishedAt: execution.finishedAt,
++      skippedProcessors: execution.skippedProcessors,
++      dynamicProcessors: execution.dynamicProcessors,
+     };
+ 
+     if (request.persist) {
+diff --git a/src/types.ts b/src/types.ts
+index 80eb622..924e3bc 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -79,6 +79,8 @@ export interface ProcessResponse {
+   warnings: string[];
+   startedAt: string;
+   finishedAt: string;
++  skippedProcessors?: string[];
++  dynamicProcessors?: string[];
+ }
+ 
+ export interface SearchQuery {
+@@ -110,6 +112,8 @@ export interface ProcessorRuntimeConfig {
+   enabled: boolean;
+   order: number;
+   dependencyIds: string[];
++  condition?: (context: ProcessingContext) => boolean | Promise<boolean>;
++  outputTransform?: (output: unknown, context: ProcessingContext) => unknown | Promise<unknown>;
+   options: Record<string, unknown>;
+ }
+ 
+@@ -118,7 +122,10 @@ export interface ProcessingContext {
+   originalContent: string;
+   workingContent: string;
+   result: ProcessingResult;
++  outputs: Record<string, unknown>;
+   startedAt: string;
++  lastError?: Error;
++  registerProcessor?: (processor: Processor, config: ProcessorRuntimeConfig) => void;
+ }
+ 
+ export interface ProcessorRunResult {
+@@ -142,6 +149,8 @@ export interface PipelineExecutionResult {
+   warnings: string[];
+   startedAt: string;
+   finishedAt: string;
++  skippedProcessors: string[];
++  dynamicProcessors: string[];
+ }
+ 
+ export interface ConfigValidationError {

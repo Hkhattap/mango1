@@ -1,0 +1,1129 @@
+diff --git a/golden_tests/processor_dependency_ordering.test.ts b/golden_tests/processor_dependency_ordering.test.ts
+new file mode 100644
+index 0000000..929028b
+--- /dev/null
++++ b/golden_tests/processor_dependency_ordering.test.ts
+@@ -0,0 +1,723 @@
++/**
++ * Golden tests for Processor Dependency Ordering feature.
++ *
++ * Tests cover:
++ * - Dependency Ordering (topological sort)
++ * - Conditional Execution
++ * - Output Transformation
++ * - Runtime Processor Registration
++ * - Integration & Regression
++ */
++
++import { ProcessorRegistry, ResolvedProcessor } from '../src/core/registry';
++import { Pipeline } from '../src/core/pipeline';
++import { MetricsCollector } from '../src/metrics/metrics';
++import { StructuredLogger } from '../src/metrics/logger';
++import { LruCache } from '../src/storage/cache';
++import {
++  Processor,
++  ProcessorDefinition,
++  ProcessorRuntimeConfig,
++  ProcessorRunResult,
++  ProcessingContext,
++  ConfigValidationResult,
++  PipelineExecutionResult,
++} from '../src/types';
++
++// ─── Helper: Create a simple test processor ────────────────────────────────────
++
++function makeProcessor(
++  id: string,
++  deps: string[] = [],
++  runFn?: (context: ProcessingContext, config: ProcessorRuntimeConfig) => Promise<ProcessorRunResult>,
++): Processor {
++  const definition: ProcessorDefinition = {
++    id,
++    name: id,
++    description: `Test processor ${id}`,
++    supportsOverrides: false,
++    dependencyIds: deps,
++  };
++
++  return {
++    definition,
++    validate(_config: ProcessorRuntimeConfig): ConfigValidationResult {
++      return { valid: true, errors: [], warnings: [] };
++    },
++    async process(context: ProcessingContext, config: ProcessorRuntimeConfig): Promise<ProcessorRunResult> {
++      if (runFn) {
++        return runFn(context, config);
++      }
++      return { output: { custom: { [`${id}_ran`]: true } } };
++    },
++  };
++}
++
++function makeConfig(
++  id: string,
++  order: number,
++  deps: string[] = [],
++  extra: Partial<ProcessorRuntimeConfig> = {},
++): ProcessorRuntimeConfig {
++  return {
++    id,
++    enabled: true,
++    order,
++    dependencyIds: deps,
++    options: {},
++    ...extra,
++  };
++}
++
++function makePipeline(processors: Processor[], configs: ProcessorRuntimeConfig[]) {
++  const registry = new ProcessorRegistry(processors, new StructuredLogger('test-registry'));
++  registry.loadRuntimeConfigs(configs);
++  return {
++    registry,
++    pipeline: new Pipeline(
++      registry,
++      new LruCache(50),
++      new MetricsCollector(),
++      new StructuredLogger('test-pipeline'),
++    ),
++  };
++}
++
++// ─── Helper: Topological sort helper for direct registry tests ─────────────────
++
++function makeResolvedProcessors(
++  items: Array<{ id: string; order: number; deps: string[] }>,
++): ResolvedProcessor[] {
++  return items.map(({ id, order, deps }) => ({
++    processor: makeProcessor(id, deps),
++    config: makeConfig(id, order, deps),
++  }));
++}
++
++function makeAllConfigs(
++  items: Array<{ id: string; order: number; deps: string[]; enabled?: boolean }>,
++): Map<string, ProcessorRuntimeConfig> {
++  const map = new Map<string, ProcessorRuntimeConfig>();
++  for (const item of items) {
++    map.set(item.id, {
++      id: item.id,
++      enabled: item.enabled ?? true,
++      order: item.order,
++      dependencyIds: item.deps,
++      options: {},
++    });
++  }
++  return map;
++}
++
++// ─── DEPENDENCY ORDERING TESTS ───────────────────────────────────────────────
++
++describe('Dependency Ordering', () => {
++  it('linear dependency chains are topologically sorted', () => {
++    // A -> B -> C (C depends on B, B depends on A)
++    const items = [
++      { id: 'C', order: 30, deps: ['B'] },
++      { id: 'A', order: 10, deps: [] },
++      { id: 'B', order: 20, deps: ['A'] },
++    ];
++    const resolved = makeResolvedProcessors(items);
++    const allConfigs = makeAllConfigs(items);
++
++    const sorted = ProcessorRegistry.topologicalSort(resolved, allConfigs);
++    const ids = sorted.map((r) => r.config.id);
++
++    expect(ids.indexOf('A')).toBeLessThan(ids.indexOf('B'));
++    expect(ids.indexOf('B')).toBeLessThan(ids.indexOf('C'));
++  });
++
++  it('circular dependencies are detected and rejected', () => {
++    // A depends on B, B depends on A
++    const items = [
++      { id: 'A', order: 10, deps: ['B'] },
++      { id: 'B', order: 20, deps: ['A'] },
++    ];
++    const resolved = makeResolvedProcessors(items);
++    const allConfigs = makeAllConfigs(items);
++
++    expect(() => ProcessorRegistry.topologicalSort(resolved, allConfigs)).toThrow(
++      /[Cc]ircular/,
++    );
++  });
++
++  it('missing dependencies are detected and rejected', () => {
++    // A depends on X which doesn't exist
++    const items = [{ id: 'A', order: 10, deps: ['X'] }];
++    const resolved = makeResolvedProcessors(items);
++    const allConfigs = makeAllConfigs(items); // X is not in allConfigs
++
++    expect(() => ProcessorRegistry.topologicalSort(resolved, allConfigs)).toThrow(
++      /missing/i,
++    );
++  });
++
++  it('disabled dependencies are detected and rejected', () => {
++    // A depends on B, B is disabled
++    const allItems = [
++      { id: 'A', order: 10, deps: ['B'], enabled: true },
++      { id: 'B', order: 5, deps: [], enabled: false },
++    ];
++    const allConfigs = makeAllConfigs(allItems);
++
++    // Only A is "resolved" (enabled), B is not in resolved
++    const resolved = makeResolvedProcessors([{ id: 'A', order: 10, deps: ['B'] }]);
++
++    expect(() => ProcessorRegistry.topologicalSort(resolved, allConfigs)).toThrow(
++      /disabled/i,
++    );
++  });
++
++  it('transitive dependencies are properly ordered', () => {
++    // D depends on C, C depends on B, B depends on A
++    const items = [
++      { id: 'D', order: 40, deps: ['C'] },
++      { id: 'C', order: 30, deps: ['B'] },
++      { id: 'B', order: 20, deps: ['A'] },
++      { id: 'A', order: 10, deps: [] },
++    ];
++    const resolved = makeResolvedProcessors(items);
++    const allConfigs = makeAllConfigs(items);
++
++    const sorted = ProcessorRegistry.topologicalSort(resolved, allConfigs);
++    const ids = sorted.map((r) => r.config.id);
++
++    expect(ids.indexOf('A')).toBeLessThan(ids.indexOf('B'));
++    expect(ids.indexOf('B')).toBeLessThan(ids.indexOf('C'));
++    expect(ids.indexOf('C')).toBeLessThan(ids.indexOf('D'));
++  });
++
++  it('diamond patterns are handled correctly', () => {
++    // D depends on B and C, both depend on A
++    const items = [
++      { id: 'D', order: 40, deps: ['B', 'C'] },
++      { id: 'C', order: 30, deps: ['A'] },
++      { id: 'B', order: 20, deps: ['A'] },
++      { id: 'A', order: 10, deps: [] },
++    ];
++    const resolved = makeResolvedProcessors(items);
++    const allConfigs = makeAllConfigs(items);
++
++    const sorted = ProcessorRegistry.topologicalSort(resolved, allConfigs);
++    const ids = sorted.map((r) => r.config.id);
++
++    expect(ids).toHaveLength(4);
++    expect(ids.indexOf('A')).toBeLessThan(ids.indexOf('B'));
++    expect(ids.indexOf('A')).toBeLessThan(ids.indexOf('C'));
++    expect(ids.indexOf('B')).toBeLessThan(ids.indexOf('D'));
++    expect(ids.indexOf('C')).toBeLessThan(ids.indexOf('D'));
++  });
++
++  it('self-dependencies are detected as circular', () => {
++    const items = [{ id: 'A', order: 10, deps: ['A'] }];
++    const resolved = makeResolvedProcessors(items);
++    const allConfigs = makeAllConfigs(items);
++
++    expect(() => ProcessorRegistry.topologicalSort(resolved, allConfigs)).toThrow(
++      /[Cc]ircular|self/i,
++    );
++  });
++
++  it('pipeline resolves processors in topological order', async () => {
++    // B depends on A - A should run before B regardless of order field
++    const executionOrder: string[] = [];
++
++    const processorA = makeProcessor('A', [], async (ctx, _cfg) => {
++      executionOrder.push('A');
++      return { output: { custom: { aResult: 42 } } };
++    });
++    const processorB = makeProcessor('B', ['A'], async (ctx, _cfg) => {
++      executionOrder.push('B');
++      return { output: { custom: { bResult: (ctx.outputs['A'] as any)?.custom?.aResult } } };
++    });
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('B', 10, ['A']), // B has lower order but depends on A
++      makeConfig('A', 20, []),    // A has higher order
++    ];
++
++    const { pipeline } = makePipeline([processorA, processorB], configs);
++    const result = await pipeline.execute({ content: 'test' });
++
++    expect(executionOrder).toEqual(['A', 'B']);
++    expect(result.processorsRun).toEqual(['A', 'B']);
++  });
++});
++
++// ─── CONDITIONAL EXECUTION TESTS ─────────────────────────────────────────────
++
++describe('Conditional Execution', () => {
++  it('processor with passing condition executes normally', async () => {
++    const processor = makeProcessor('conditional', [], async (_ctx, _cfg) => {
++      return { output: { custom: { ran: true } } };
++    });
++
++    const config = makeConfig('conditional', 10, [], {
++      condition: async (_ctx) => true,
++    });
++
++    const { pipeline } = makePipeline([processor], [config]);
++    const result = await pipeline.execute({ content: 'hello' });
++
++    expect(result.processorsRun).toContain('conditional');
++    expect(result.skippedProcessors).not.toContain('conditional');
++  });
++
++  it('processor with failing condition is skipped and produces no output', async () => {
++    const processor = makeProcessor('skipped', [], async (_ctx, _cfg) => {
++      return { output: { custom: { ran: true } } };
++    });
++
++    const config = makeConfig('skipped', 10, [], {
++      condition: async (_ctx) => false,
++    });
++
++    const { pipeline } = makePipeline([processor], [config]);
++    const result = await pipeline.execute({ content: 'hello' });
++
++    expect(result.processorsRun).not.toContain('skipped');
++    expect(result.skippedProcessors).toContain('skipped');
++    // The processor was skipped, so its output should not be in processorsRun
++    expect(result.processorsRun).toHaveLength(0);
++  });
++
++  it('dependent processor fails if required dependency is skipped', async () => {
++    // A is skipped, B depends on A and has no condition -> B should fail with error
++    const processorA = makeProcessor('A', [], async () => ({ output: {} }));
++    const processorB = makeProcessor('B', ['A'], async () => ({ output: {} }));
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('A', 10, [], { condition: async () => false }),
++      makeConfig('B', 20, ['A']), // no condition
++    ];
++
++    const { pipeline } = makePipeline([processorA, processorB], configs);
++    const result = await pipeline.execute({ content: 'hello' });
++
++    expect(result.skippedProcessors).toContain('A');
++    expect(result.processorsRun).not.toContain('B');
++    expect(result.errors.some((e) => e.includes('B'))).toBe(true);
++  });
++
++  it('async conditions are properly awaited', async () => {
++    let conditionResolved = false;
++    const processor = makeProcessor('async-cond', [], async () => ({
++      output: { custom: { ran: true } },
++    }));
++
++    const config = makeConfig('async-cond', 10, [], {
++      condition: async (_ctx) => {
++        await new Promise((resolve) => setTimeout(resolve, 10));
++        conditionResolved = true;
++        return true;
++      },
++    });
++
++    const { pipeline } = makePipeline([processor], [config]);
++    const result = await pipeline.execute({ content: 'test' });
++
++    expect(conditionResolved).toBe(true);
++    expect(result.processorsRun).toContain('async-cond');
++  });
++
++  it('result includes all skipped processor IDs', async () => {
++    const pA = makeProcessor('A', [], async () => ({ output: {} }));
++    const pB = makeProcessor('B', [], async () => ({ output: {} }));
++    const pC = makeProcessor('C', [], async () => ({ output: {} }));
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('A', 10, [], { condition: async () => false }),
++      makeConfig('B', 20, [], { condition: async () => false }),
++      makeConfig('C', 30, []),
++    ];
++
++    const { pipeline } = makePipeline([pA, pB, pC], configs);
++    const result = await pipeline.execute({ content: 'test' });
++
++    expect(result.skippedProcessors).toContain('A');
++    expect(result.skippedProcessors).toContain('B');
++    expect(result.skippedProcessors).not.toContain('C');
++    expect(result.processorsRun).toContain('C');
++  });
++});
++
++// ─── OUTPUT TRANSFORMATION TESTS ─────────────────────────────────────────────
++
++describe('Output Transformation', () => {
++  it('processor output is transformed before being stored in context.outputs', async () => {
++    let seenOutput: unknown;
++
++    const processorA = makeProcessor('A', [], async () => ({
++      output: { custom: { value: 'original' } },
++    }));
++
++    const processorB = makeProcessor('B', ['A'], async (ctx, _cfg) => {
++      seenOutput = ctx.outputs['A'];
++      return { output: {} };
++    });
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('A', 10, [], {
++        outputTransform: async (output, _ctx) => {
++          // Transform: change value to 'transformed'
++          return { custom: { value: 'transformed' } };
++        },
++      }),
++      makeConfig('B', 20, ['A']),
++    ];
++
++    const { pipeline } = makePipeline([processorA, processorB], configs);
++    await pipeline.execute({ content: 'test' });
++
++    expect(seenOutput).toEqual({ custom: { value: 'transformed' } });
++  });
++
++  it('downstream processor receives transformed output, not original', async () => {
++    let downstreamSawOutput: unknown;
++
++    const processorA = makeProcessor('upstream', [], async () => ({
++      output: { custom: { data: 'raw' } },
++    }));
++
++    const processorB = makeProcessor('downstream', ['upstream'], async (ctx, _cfg) => {
++      downstreamSawOutput = ctx.outputs['upstream'];
++      return { output: {} };
++    });
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('upstream', 10, [], {
++        outputTransform: (_output, _ctx) => ({ custom: { data: 'processed' } }),
++      }),
++      makeConfig('downstream', 20, ['upstream']),
++    ];
++
++    const { pipeline } = makePipeline([processorA, processorB], configs);
++    await pipeline.execute({ content: 'hello world' });
++
++    expect(downstreamSawOutput).toEqual({ custom: { data: 'processed' } });
++    expect((downstreamSawOutput as any)?.custom?.data).toBe('processed');
++  });
++
++  it('async transformations are properly awaited', async () => {
++    let transformCompleted = false;
++    let seenOutput: unknown;
++
++    const processorA = makeProcessor('tx-async', [], async () => ({
++      output: { custom: { num: 1 } },
++    }));
++
++    const processorB = makeProcessor('tx-consumer', ['tx-async'], async (ctx, _cfg) => {
++      seenOutput = ctx.outputs['tx-async'];
++      return { output: {} };
++    });
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('tx-async', 10, [], {
++        outputTransform: async (output, _ctx) => {
++          await new Promise((resolve) => setTimeout(resolve, 10));
++          transformCompleted = true;
++          return { custom: { num: 99 } };
++        },
++      }),
++      makeConfig('tx-consumer', 20, ['tx-async']),
++    ];
++
++    const { pipeline } = makePipeline([processorA, processorB], configs);
++    await pipeline.execute({ content: 'test' });
++
++    expect(transformCompleted).toBe(true);
++    expect(seenOutput).toEqual({ custom: { num: 99 } });
++  });
++
++  it('multiple processors with transformations chain correctly', async () => {
++    const seenByC: Record<string, unknown> = {};
++
++    const processorA = makeProcessor('chainA', [], async () => ({
++      output: { custom: { val: 'a-original' } },
++    }));
++
++    const processorB = makeProcessor('chainB', [], async () => ({
++      output: { custom: { val: 'b-original' } },
++    }));
++
++    const processorC = makeProcessor('chainC', ['chainA', 'chainB'], async (ctx, _cfg) => {
++      seenByC['chainA'] = ctx.outputs['chainA'];
++      seenByC['chainB'] = ctx.outputs['chainB'];
++      return { output: {} };
++    });
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('chainA', 10, [], {
++        outputTransform: (_o, _ctx) => ({ custom: { val: 'a-transformed' } }),
++      }),
++      makeConfig('chainB', 20, [], {
++        outputTransform: (_o, _ctx) => ({ custom: { val: 'b-transformed' } }),
++      }),
++      makeConfig('chainC', 30, ['chainA', 'chainB']),
++    ];
++
++    const { pipeline } = makePipeline([processorA, processorB, processorC], configs);
++    await pipeline.execute({ content: 'test' });
++
++    expect(seenByC['chainA']).toEqual({ custom: { val: 'a-transformed' } });
++    expect(seenByC['chainB']).toEqual({ custom: { val: 'b-transformed' } });
++  });
++});
++
++// ─── RUNTIME REGISTRATION TESTS ──────────────────────────────────────────────
++
++describe('Runtime Processor Registration', () => {
++  it('processor can register a new processor mid-execution', async () => {
++    const dynamicRan: string[] = [];
++
++    const dynamicProcessor = makeProcessor('dynamic', [], async (_ctx, _cfg) => {
++      dynamicRan.push('dynamic');
++      return { output: {} };
++    });
++
++    const processorA = makeProcessor('registrar', [], async (ctx, _cfg) => {
++      // Register a new processor during execution
++      ctx.registerProcessor!(dynamicProcessor, makeConfig('dynamic', 99, []));
++      return { output: {} };
++    });
++
++    const { pipeline } = makePipeline([processorA], [makeConfig('registrar', 10, [])]);
++    const result = await pipeline.execute({ content: 'test' });
++
++    expect(result.processorsRun).toContain('registrar');
++    expect(result.processorsRun).toContain('dynamic');
++    expect(dynamicRan).toContain('dynamic');
++  });
++
++  it('dynamically registered processor is topologically sorted with existing processors', async () => {
++    const executionOrder: string[] = [];
++
++    const processorB = makeProcessor('B', [], async (_ctx, _cfg) => {
++      executionOrder.push('B');
++      return { output: {} };
++    });
++
++    // Dynamic D depends on B - so D must run after B
++    const processorD = makeProcessor('D', ['B'], async (_ctx, _cfg) => {
++      executionOrder.push('D');
++      return { output: {} };
++    });
++
++    const processorA = makeProcessor('A', [], async (ctx, _cfg) => {
++      executionOrder.push('A');
++      // Register D which depends on B
++      ctx.registerProcessor!(processorD, makeConfig('D', 99, ['B']));
++      return { output: {} };
++    });
++
++    // B has higher order (runs later normally), but D depends on B
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('A', 10, []),
++      makeConfig('B', 20, []),
++    ];
++
++    const { pipeline } = makePipeline([processorA, processorB], configs);
++    const result = await pipeline.execute({ content: 'test' });
++
++    // D must come after B in execution
++    expect(result.processorsRun).toContain('D');
++    const bIdx = result.processorsRun.indexOf('B');
++    const dIdx = result.processorsRun.indexOf('D');
++    expect(bIdx).toBeLessThan(dIdx);
++  });
++
++  it('dynamically registered processor executes and produces output', async () => {
++    const dynamicProcessor = makeProcessor('dynProc', [], async (_ctx, _cfg) => {
++      return { output: { custom: { dynamicOutput: 'hello from dynamic' } } };
++    });
++
++    const processorA = makeProcessor('trigger', [], async (ctx, _cfg) => {
++      ctx.registerProcessor!(dynamicProcessor, makeConfig('dynProc', 99, []));
++      return { output: {} };
++    });
++
++    const { pipeline } = makePipeline([processorA], [makeConfig('trigger', 10, [])]);
++    const result = await pipeline.execute({ content: 'test' });
++
++    expect(result.processorsRun).toContain('dynProc');
++    // The dynamic processor ran and produced output merged into result
++    expect(result.result.custom).toEqual({ dynamicOutput: 'hello from dynamic' });
++  });
++
++  it('result includes all dynamically registered processor IDs', async () => {
++    const dynP1 = makeProcessor('dyn1', [], async () => ({ output: {} }));
++    const dynP2 = makeProcessor('dyn2', [], async () => ({ output: {} }));
++
++    const processorA = makeProcessor('A', [], async (ctx, _cfg) => {
++      ctx.registerProcessor!(dynP1, makeConfig('dyn1', 90, []));
++      ctx.registerProcessor!(dynP2, makeConfig('dyn2', 91, []));
++      return { output: {} };
++    });
++
++    const { pipeline } = makePipeline([processorA], [makeConfig('A', 10, [])]);
++    const result = await pipeline.execute({ content: 'test' });
++
++    expect(result.dynamicProcessors).toContain('dyn1');
++    expect(result.dynamicProcessors).toContain('dyn2');
++  });
++});
++
++// ─── INTEGRATION & REGRESSION TESTS ──────────────────────────────────────────
++
++describe('Integration & Regression', () => {
++  it('complex pipeline with conditionals, registrations, and transforms executes correctly', async () => {
++    const executionOrder: string[] = [];
++    const seenContextOutputs: Record<string, unknown> = {};
++
++    // Processor A: always runs, produces output, transformed
++    const processorA = makeProcessor('A', [], async (_ctx, _cfg) => {
++      executionOrder.push('A');
++      return { output: { custom: { from: 'A', val: 10 } } };
++    });
++
++    // Processor B: conditionally runs (condition: A's output val > 5)
++    const processorB = makeProcessor('B', ['A'], async (ctx, _cfg) => {
++      executionOrder.push('B');
++      seenContextOutputs['A'] = ctx.outputs['A'];
++      return { output: { custom: { from: 'B' } } };
++    });
++
++    // Dynamic processor registered by B
++    const processorDyn = makeProcessor('Dyn', [], async (ctx, _cfg) => {
++      executionOrder.push('Dyn');
++      return { output: { custom: { from: 'Dyn' } } };
++    });
++
++    // Processor C: depends on B, has no condition
++    const processorC = makeProcessor('C', ['B'], async (_ctx, _cfg) => {
++      executionOrder.push('C');
++      return { output: {} };
++    });
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('A', 10, [], {
++        outputTransform: (output, _ctx) => {
++          const o = output as { custom: { from: string; val: number } };
++          return { custom: { from: o.custom.from, val: o.custom.val * 2 } }; // val becomes 20
++        },
++      }),
++      makeConfig('B', 20, ['A'], {
++        condition: async (ctx) => {
++          const aOut = ctx.outputs['A'] as { custom: { val: number } } | undefined;
++          return (aOut?.custom?.val ?? 0) > 5;
++        },
++      }),
++      makeConfig('C', 30, ['B']),
++    ];
++
++    // Note: B also registers Dyn during execution - but we need B to have access to registerProcessor
++    // Let's add Dyn registration to B's process function
++    const processorBWithReg = makeProcessor('B', ['A'], async (ctx, _cfg) => {
++      executionOrder.push('B');
++      seenContextOutputs['A'] = ctx.outputs['A'];
++      ctx.registerProcessor!(processorDyn, makeConfig('Dyn', 25, []));
++      return { output: { custom: { from: 'B' } } };
++    });
++
++    const { pipeline } = makePipeline(
++      [processorA, processorBWithReg, processorC],
++      configs,
++    );
++    const result = await pipeline.execute({ content: 'integration test' });
++
++    // A should have run
++    expect(executionOrder).toContain('A');
++    // B's condition checks A's output which is transformed to val=20 > 5 -> B runs
++    expect(executionOrder).toContain('B');
++    // C depends on B which ran -> C should run
++    expect(executionOrder).toContain('C');
++    // Dyn was registered by B and should run
++    expect(executionOrder).toContain('Dyn');
++    // A's output seen by B should be the transformed value
++    expect((seenContextOutputs['A'] as any)?.custom?.val).toBe(20);
++    // Result should include dynamic processors
++    expect(result.dynamicProcessors).toContain('Dyn');
++  });
++
++  it('original dependency ordering behavior is preserved when no new features are used', async () => {
++    // No conditions, no transforms, no dynamic registration
++    const pA = makeProcessor('plain-A', [], async () => ({ output: {} }));
++    const pB = makeProcessor('plain-B', [], async () => ({ output: {} }));
++    const pC = makeProcessor('plain-C', [], async () => ({ output: {} }));
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('plain-A', 10, []),
++      makeConfig('plain-B', 20, []),
++      makeConfig('plain-C', 30, []),
++    ];
++
++    const { pipeline } = makePipeline([pA, pB, pC], configs);
++    const result = await pipeline.execute({ content: 'test content' });
++
++    expect(result.processorsRun).toEqual(['plain-A', 'plain-B', 'plain-C']);
++    expect(result.errors).toHaveLength(0);
++    expect(result.skippedProcessors).toHaveLength(0);
++    expect(result.dynamicProcessors).toHaveLength(0);
++  });
++
++  it('output isolation prevents processors from overwriting each other', async () => {
++    const capturedOutputs: Record<string, unknown>[] = [];
++
++    const processorA = makeProcessor('iso-A', [], async () => ({
++      output: { custom: { ownerA: 'valueA', shared: 'from-A' } },
++    }));
++
++    const processorB = makeProcessor('iso-B', [], async (ctx, _cfg) => {
++      capturedOutputs.push({ ...ctx.outputs });
++      return { output: { custom: { ownerB: 'valueB', shared: 'from-B' } } };
++    });
++
++    const processorC = makeProcessor('iso-C', ['iso-A', 'iso-B'], async (ctx, _cfg) => {
++      capturedOutputs.push({ ...ctx.outputs });
++      return { output: {} };
++    });
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('iso-A', 10, []),
++      makeConfig('iso-B', 20, []),
++      makeConfig('iso-C', 30, ['iso-A', 'iso-B']),
++    ];
++
++    const { pipeline } = makePipeline([processorA, processorB, processorC], configs);
++    await pipeline.execute({ content: 'isolation test' });
++
++    // When C runs, it should see both iso-A and iso-B outputs
++    const cOutputs = capturedOutputs[1];
++    expect(cOutputs['iso-A']).toBeDefined();
++    expect(cOutputs['iso-B']).toBeDefined();
++    // Each processor's output is stored under its own key
++    expect((cOutputs['iso-A'] as any)?.custom?.ownerA).toBe('valueA');
++    expect((cOutputs['iso-B'] as any)?.custom?.ownerB).toBe('valueB');
++  });
++
++  it('processor errors are caught and reported correctly', async () => {
++    const throwingProcessor = makeProcessor('thrower', [], async () => {
++      throw new Error('Something went wrong');
++    });
++
++    const afterProcessor = makeProcessor('after', [], async () => ({
++      output: { custom: { afterRan: true } },
++    }));
++
++    const configs: ProcessorRuntimeConfig[] = [
++      makeConfig('thrower', 10, []),
++      makeConfig('after', 20, []),
++    ];
++
++    const { pipeline } = makePipeline([throwingProcessor, afterProcessor], configs);
++    const result = await pipeline.execute({ content: 'test' });
++
++    expect(result.errors.some((e) => e.includes('thrower') && e.includes('Something went wrong'))).toBe(true);
++    // After processor should still run
++    expect(result.processorsRun).toContain('after');
++    expect(result.result.custom).toEqual({ afterRan: true });
++  });
++});
+diff --git a/src/core/pipeline.ts b/src/core/pipeline.ts
+index 829c1ee..6cf512e 100644
+--- a/src/core/pipeline.ts
++++ b/src/core/pipeline.ts
+@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
+ import { MetricsCollector } from '../metrics/metrics';
+ import { StructuredLogger } from '../metrics/logger';
+ import { LruCache } from '../storage/cache';
+-import { PipelineExecutionResult, ProcessNoteRequest, ProcessingContext, ProcessingResult } from '../types';
+-import { ProcessorRegistry } from './registry';
++import { PipelineExecutionResult, Processor, ProcessNoteRequest, ProcessingContext, ProcessingResult, ProcessorRuntimeConfig } from '../types';
++import { ProcessorRegistry, ResolvedProcessor } from './registry';
+ 
+ function clone<T>(value: T): T {
+   return JSON.parse(JSON.stringify(value)) as T;
+@@ -56,19 +56,139 @@ export class Pipeline {
+       workingCopy: request.content,
+     };
+ 
++    const outputs: Record<string, unknown> = {};
++
+     const context: ProcessingContext = {
+       request,
+       originalContent: request.content,
+       workingContent: request.content,
+       result,
+       startedAt,
++      outputs,
+     };
+ 
+     const errors: string[] = [];
+     const warnings: string[] = [];
+     const processorsRun: string[] = [];
++    const skippedProcessors: string[] = [];
++    const dynamicProcessors: string[] = [];
++
++    // Dynamic processors registered during execution
++    const pendingDynamicProcessors: Array<{ processor: Processor; config: ProcessorRuntimeConfig }> = [];
++
++    // Set up the registerProcessor function on context
++    context.registerProcessor = (processor: Processor, config: ProcessorRuntimeConfig) => {
++      pendingDynamicProcessors.push({ processor, config });
++    };
++
++    // Track which processors have been skipped (for dependency checking)
++    const skippedSet = new Set<string>();
++
++    // Track which processors have already been executed (for topological sort of dynamic processors)
++    const executedSet = new Set<string>();
++
++    // We'll process in a queue to support dynamic registration
++    const processorQueue: ResolvedProcessor[] = [...resolvedProcessors];
++
++    // All processor configs seen so far (for topological sort of dynamic processors)
++    const allConfigsSeen = new Map<string, ProcessorRuntimeConfig>();
++    for (const rp of resolvedProcessors) {
++      allConfigsSeen.set(rp.config.id, rp.config);
++    }
++
++    /**
++     * Insert newly registered dynamic processors into the queue, re-sorting topologically.
++     */
++    const flushDynamicProcessors = (insertAtIndex: number) => {
++      if (pendingDynamicProcessors.length === 0) return;
++
++      const newDynamicProcessors = [...pendingDynamicProcessors];
++      pendingDynamicProcessors.length = 0;
++
++      for (const dp of newDynamicProcessors) {
++        allConfigsSeen.set(dp.config.id, dp.config);
++        dynamicProcessors.push(dp.config.id);
++      }
++
++      // Build the remaining queue + new dynamic processors and re-sort topologically
++      const remaining = processorQueue.slice(insertAtIndex);
++      const dynamicResolved: ResolvedProcessor[] = newDynamicProcessors.map((dp) => ({
++        processor: dp.processor,
++        config: dp.config,
++      }));
++
++      // Combine remaining + dynamic, re-sort
++      const combined = [...remaining, ...dynamicResolved];
++      try {
++        const sorted = ProcessorRegistry.topologicalSort(combined, allConfigsSeen, executedSet);
++        // Replace the remaining queue with the sorted result
++        processorQueue.splice(insertAtIndex, processorQueue.length - insertAtIndex, ...sorted);
++      } catch (err) {
++        // If topological sort fails for dynamic processors, report error but keep remaining
++        const message = err instanceof Error ? err.message : String(err);
++        errors.push(`dynamic-registration: ${message}`);
++        processorQueue.splice(insertAtIndex, processorQueue.length - insertAtIndex, ...remaining);
++      }
++    };
++
++    let queueIndex = 0;
++    while (queueIndex < processorQueue.length) {
++      // Before processing this item, check if any dynamic processors have been registered
++      flushDynamicProcessors(queueIndex);
++
++      if (queueIndex >= processorQueue.length) break;
++
++      const { processor, config } = processorQueue[queueIndex];
++      queueIndex++;
++
++      // Check if any dependency was skipped - if so, handle accordingly
++      const deps = config.dependencyIds ?? [];
++      let dependencySkipped = false;
++      for (const depId of deps) {
++        if (skippedSet.has(depId)) {
++          dependencySkipped = true;
++          break;
++        }
++      }
++
++      if (dependencySkipped) {
++        if (config.condition) {
++          // Has a condition - skip it
++          skippedProcessors.push(processor.definition.id);
++          skippedSet.add(processor.definition.id);
++          continue;
++        } else {
++          // No condition - fail with error
++          const message = `Processor "${processor.definition.id}" depends on a skipped processor`;
++          errors.push(`${config.id}: ${message}`);
++          this.logger.error('processor-failed', {
++            processorId: processor.definition.id,
++            message,
++          });
++          continue;
++        }
++      }
++
++      // Evaluate condition if present
++      if (config.condition) {
++        let conditionResult: boolean;
++        try {
++          conditionResult = await config.condition(context);
++        } catch (err) {
++          const message = err instanceof Error ? err.message : String(err);
++          errors.push(`${config.id}: condition evaluation failed: ${message}`);
++          skippedProcessors.push(processor.definition.id);
++          skippedSet.add(processor.definition.id);
++          continue;
++        }
++
++        if (!conditionResult) {
++          skippedProcessors.push(processor.definition.id);
++          skippedSet.add(processor.definition.id);
++          continue;
++        }
++      }
+ 
+-    for (const { processor, config } of resolvedProcessors) {
+       const validation = processor.validate(config);
+       if (!validation.valid) {
+         errors.push(...validation.errors.map((entry) => `${config.id}: ${entry.message}`));
+@@ -81,9 +201,24 @@ export class Pipeline {
+       try {
+         const run = await processor.process(context, config);
+         processorsRun.push(processor.definition.id);
+-        if (run.output) {
+-          Object.assign(context.result, run.output);
++        executedSet.add(processor.definition.id);
++
++        // Compute raw output
++        let rawOutput: unknown = run.output ?? {};
++
++        // Apply output transform if present
++        if (config.outputTransform) {
++          rawOutput = await config.outputTransform(rawOutput, context);
+         }
++
++        // Store in outputs under the processor's ID
++        outputs[processor.definition.id] = rawOutput;
++
++        // Also merge into context.result for backwards compatibility
++        if (rawOutput && typeof rawOutput === 'object') {
++          Object.assign(context.result, rawOutput);
++        }
++
+         if (run.nextContent !== undefined) {
+           context.workingContent = run.nextContent;
+           context.result.workingCopy = run.nextContent;
+@@ -99,11 +234,15 @@ export class Pipeline {
+         this.metrics.recordProcessorRun(processor.definition.id, performance.now() - runStarted, false);
+         const message = error instanceof Error ? error.message : String(error);
+         errors.push(`${config.id}: ${message}`);
++        context.lastError = error instanceof Error ? error : new Error(message);
+         this.logger.error('processor-failed', {
+           processorId: processor.definition.id,
+           message,
+         });
+       }
++
++      // After each processor, flush any newly registered dynamic processors
++      flushDynamicProcessors(queueIndex);
+     }
+ 
+     const finishedAt = new Date().toISOString();
+@@ -115,6 +254,8 @@ export class Pipeline {
+       warnings,
+       startedAt,
+       finishedAt,
++      skippedProcessors: skippedProcessors.length > 0 ? skippedProcessors : [],
++      dynamicProcessors: dynamicProcessors.length > 0 ? dynamicProcessors : [],
+     };
+ 
+     this.cache.set(cacheKey, clone(execution));
+diff --git a/src/core/registry.ts b/src/core/registry.ts
+index 85a65a9..0f82a7b 100644
+--- a/src/core/registry.ts
++++ b/src/core/registry.ts
+@@ -56,8 +56,131 @@ export class ProcessorRegistry {
+     return next;
+   }
+ 
++  /**
++   * Topologically sort the given resolved processors based on their dependencyIds.
++   * Throws if there are circular dependencies, missing dependencies, or disabled dependencies.
++   *
++   * @param resolvedProcessors - Processors to sort (only enabled processors)
++   * @param allConfigs - All known processor configs (enabled and disabled)
++   * @param alreadyExecuted - Set of processor IDs that have already been executed (optional)
++   *                          These are considered satisfied dependencies and won't cause errors.
++   */
++  static topologicalSort(
++    resolvedProcessors: ResolvedProcessor[],
++    allConfigs: Map<string, ProcessorRuntimeConfig>,
++    alreadyExecuted: Set<string> = new Set(),
++  ): ResolvedProcessor[] {
++    const resolvedMap = new Map<string, ResolvedProcessor>();
++    for (const rp of resolvedProcessors) {
++      resolvedMap.set(rp.config.id, rp);
++    }
++
++    // Validate dependencies
++    for (const rp of resolvedProcessors) {
++      const deps = rp.config.dependencyIds ?? [];
++      for (const depId of deps) {
++        // Self-dependency check
++        if (depId === rp.config.id) {
++          throw new Error(`Processor "${rp.config.id}" has a self-dependency`);
++        }
++        // Check if the dependency exists in allConfigs
++        if (!allConfigs.has(depId)) {
++          throw new Error(`Processor "${rp.config.id}" depends on missing processor "${depId}"`);
++        }
++        // If the dependency has already been executed, it's satisfied - no error
++        if (alreadyExecuted.has(depId)) {
++          continue;
++        }
++        // Check if the dependency is disabled (not in resolvedMap and not already executed)
++        const depConfig = allConfigs.get(depId)!;
++        if (!depConfig.enabled || !resolvedMap.has(depId)) {
++          throw new Error(`Processor "${rp.config.id}" depends on disabled processor "${depId}"`);
++        }
++      }
++    }
++
++    // Kahn's algorithm for topological sort
++    // Only consider dependencies that are within the current resolved set
++    // (not already-executed ones, which are already satisfied)
++    const inDegree = new Map<string, number>();
++    const adjacency = new Map<string, string[]>(); // depId -> dependents
++
++    for (const rp of resolvedProcessors) {
++      const id = rp.config.id;
++      if (!inDegree.has(id)) inDegree.set(id, 0);
++      if (!adjacency.has(id)) adjacency.set(id, []);
++
++      const deps = rp.config.dependencyIds ?? [];
++      for (const depId of deps) {
++        // Skip already-executed dependencies - they don't affect ordering within this set
++        if (alreadyExecuted.has(depId)) {
++          continue;
++        }
++        // Only count dependencies that are within the current resolved set
++        if (!resolvedMap.has(depId)) {
++          continue;
++        }
++        const existing = adjacency.get(depId) ?? [];
++        existing.push(id);
++        adjacency.set(depId, existing);
++        inDegree.set(id, (inDegree.get(id) ?? 0) + 1);
++      }
++    }
++
++    // Start with nodes that have no unresolved dependencies (in-degree 0)
++    // Among those, sort by order for deterministic ordering
++    const queue: string[] = [];
++    for (const [id, degree] of inDegree) {
++      if (degree === 0) {
++        queue.push(id);
++      }
++    }
++    queue.sort((a, b) => {
++      const orderA = resolvedMap.get(a)!.config.order;
++      const orderB = resolvedMap.get(b)!.config.order;
++      return orderA - orderB;
++    });
++
++    const sorted: ResolvedProcessor[] = [];
++    while (queue.length > 0) {
++      // Pick the first item (already sorted by order)
++      const id = queue.shift()!;
++      const rp = resolvedMap.get(id)!;
++      sorted.push(rp);
++
++      const dependents = adjacency.get(id) ?? [];
++      const newlyZero: string[] = [];
++      for (const depId of dependents) {
++        const newDegree = (inDegree.get(depId) ?? 0) - 1;
++        inDegree.set(depId, newDegree);
++        if (newDegree === 0) {
++          newlyZero.push(depId);
++        }
++      }
++      // Sort newly zero by order before adding to queue
++      newlyZero.sort((a, b) => {
++        const orderA = resolvedMap.get(a)!.config.order;
++        const orderB = resolvedMap.get(b)!.config.order;
++        return orderA - orderB;
++      });
++      queue.push(...newlyZero);
++    }
++
++    if (sorted.length !== resolvedProcessors.length) {
++      // There is a cycle
++      const inCycle = resolvedProcessors
++        .filter((rp) => !sorted.find((s) => s.config.id === rp.config.id))
++        .map((rp) => rp.config.id);
++      throw new Error(`Circular dependency detected among processors: ${inCycle.join(', ')}`);
++    }
++
++    return sorted;
++  }
++
+   resolve(overrides: Record<string, ProcessorOverride> = {}): ResolvedProcessor[] {
+-    return this.getRuntimeConfigs()
++    const allConfigs = new Map<string, ProcessorRuntimeConfig>(this.runtimeConfigs);
++
++    const resolved = this.getRuntimeConfigs()
+       .map((config) => {
+         const processor = this.processors.get(config.id);
+         if (!processor) {
+@@ -65,7 +188,7 @@ export class ProcessorRegistry {
+         }
+ 
+         const override = overrides[config.id];
+-        const resolved: ProcessorRuntimeConfig = {
++        const resolvedConfig: ProcessorRuntimeConfig = {
+           ...config,
+           enabled: override?.enabled ?? config.enabled,
+           options: {
+@@ -76,9 +199,12 @@ export class ProcessorRegistry {
+ 
+         return {
+           processor,
+-          config: resolved,
++          config: resolvedConfig,
+         };
+       })
+       .filter((value): value is ResolvedProcessor => value !== null && value.config.enabled);
++
++    // Apply topological sorting
++    return ProcessorRegistry.topologicalSort(resolved, allConfigs);
+   }
+ }
+diff --git a/src/types.ts b/src/types.ts
+index 80eb622..bde48ff 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -111,6 +111,8 @@ export interface ProcessorRuntimeConfig {
+   order: number;
+   dependencyIds: string[];
+   options: Record<string, unknown>;
++  condition?: (context: ProcessingContext) => boolean | Promise<boolean>;
++  outputTransform?: (output: unknown, context: ProcessingContext) => unknown | Promise<unknown>;
+ }
+ 
+ export interface ProcessingContext {
+@@ -119,6 +121,9 @@ export interface ProcessingContext {
+   workingContent: string;
+   result: ProcessingResult;
+   startedAt: string;
++  outputs: Record<string, unknown>;
++  lastError?: Error;
++  registerProcessor?: (processor: Processor, config: ProcessorRuntimeConfig) => void;
+ }
+ 
+ export interface ProcessorRunResult {
+@@ -142,6 +147,8 @@ export interface PipelineExecutionResult {
+   warnings: string[];
+   startedAt: string;
+   finishedAt: string;
++  skippedProcessors?: string[];
++  dynamicProcessors?: string[];
+ }
+ 
+ export interface ConfigValidationError {
